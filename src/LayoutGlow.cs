@@ -22,10 +22,11 @@ namespace LayoutGlow
     {
         public bool ConvertEnabled = true;
         public bool BacklightEnabled = true;
-        public int DoubleTapMs = 400;
+        public int DoubleTapMs = 600;
         public byte EnR = 0, EnG = 255, EnB = 0;
         public byte RuR = 255, RuG = 0, RuB = 0;
         public bool SwitchLayoutAfterConvert = true;
+        public bool LogEnabled = false; // debug log to LayoutGlow.log next to the exe
 
         public static string PathName
         {
@@ -48,6 +49,7 @@ namespace LayoutGlow
                     else if (k == "backlightenabled") s.BacklightEnabled = v == "1";
                     else if (k == "doubletapms") s.DoubleTapMs = int.Parse(v);
                     else if (k == "switchlayout") s.SwitchLayoutAfterConvert = v == "1";
+                    else if (k == "logenabled") s.LogEnabled = v == "1";
                     else if (k == "encolor") ParseColor(v, out s.EnR, out s.EnG, out s.EnB);
                     else if (k == "rucolor") ParseColor(v, out s.RuR, out s.RuG, out s.RuB);
                 }
@@ -65,6 +67,7 @@ namespace LayoutGlow
                 sb.AppendLine("BacklightEnabled=" + (BacklightEnabled ? "1" : "0"));
                 sb.AppendLine("DoubleTapMs=" + DoubleTapMs);
                 sb.AppendLine("SwitchLayout=" + (SwitchLayoutAfterConvert ? "1" : "0"));
+                sb.AppendLine("LogEnabled=" + (LogEnabled ? "1" : "0"));
                 sb.AppendLine("EnColor=" + EnR + "," + EnG + "," + EnB);
                 sb.AppendLine("RuColor=" + RuR + "," + RuG + "," + RuB);
                 File.WriteAllText(PathName, sb.ToString());
@@ -107,7 +110,7 @@ namespace LayoutGlow
         private bool _enabled;   // false = do not touch the keyboard at all
         private bool _dirty;
         private byte _cr, _cg, _cb;
-        private const int PollMs = 200;
+        private const int PollMs = 50;
         private const int KeepaliveMs = 5000; // re-send color periodically (recovery after keyboard replug)
         private int _sinceLastSend = KeepaliveMs;
 
@@ -120,8 +123,12 @@ namespace LayoutGlow
 
         public bool DeviceFound { get; private set; }
 
+        // Master switch for the debug log, set once at startup from Settings.
+        public static bool LoggingEnabled;
+
         internal static void Log(string msg)
         {
+            if (!LoggingEnabled) return;
             try
             {
                 File.AppendAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LayoutGlow.log"),
@@ -514,6 +521,15 @@ namespace LayoutGlow
         [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
+        [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+        [DllImport("user32.dll")] private static extern IntPtr GetKeyboardLayout(uint idThread);
+        // CharSet.Unicode is critical: with the default Ansi marshalling the CLR
+        // reinterpreted the UTF-16 output as bytes, truncating every non-ASCII
+        // char to its low byte ("привет" -> "?@825B").
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int ToUnicodeEx(uint wVirtKey, uint wScanCode, byte[] lpKeyState, [Out] StringBuilder pwszBuff, int cchBuff, uint wFlags, IntPtr dwhkl);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr LoadKeyboardLayout(string pwszKLID, uint Flags);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+        [DllImport("user32.dll")] private static extern short GetKeyState(int nVirtKey);
 
         private readonly Settings _settings;
         private readonly Action _onConverted;
@@ -524,11 +540,19 @@ namespace LayoutGlow
         private readonly object _convertLock = new object();
         private bool _converting;
 
+        // ---- last-typed-word tracking (console-safe conversion, Punto/Caramba style) ----
+        private const int MaxWordLen = 64;
+        private readonly StringBuilder _word = new StringBuilder(MaxWordLen);
+        private readonly object _wordLock = new object();
+        private bool _shiftDown, _ctrlDown, _altDown, _capsOn;
+        private IntPtr _lastForeground = IntPtr.Zero;
+
         public ConvertEngine(Settings settings, Action onConverted)
         {
             _settings = settings;
             _onConverted = onConverted;
             _proc = HookCallback;
+            _mouseProc = MouseHookCallback;
         }
 
         public void Install()
@@ -536,7 +560,9 @@ namespace LayoutGlow
             using (var curProcess = Process.GetCurrentProcess())
             using (var curModule = curProcess.MainModule)
             {
-                _hookId = SetWindowsHookEx(WhKeyboardLl, _proc, GetModuleHandle(curModule.ModuleName), 0);
+                var module = GetModuleHandle(curModule.ModuleName);
+                _hookId = SetWindowsHookEx(WhKeyboardLl, _proc, module, 0);
+                _mouseHookId = SetWindowsHookEx(WhMouseLl, _mouseProc, module, 0);
             }
         }
 
@@ -547,6 +573,38 @@ namespace LayoutGlow
                 UnhookWindowsHookEx(_hookId);
                 _hookId = IntPtr.Zero;
             }
+            if (_mouseHookId != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(_mouseHookId);
+                _mouseHookId = IntPtr.Zero;
+            }
+        }
+
+        // A mouse click can move the caret, invalidating the tracked word (typing
+        // backspaces would then erase the wrong text). Console carets always sit at
+        // the end of the input line, so clicks there are harmless.
+        private const int WhMouseLl = 14;
+        private const int WmLButtonDown = 0x0201;
+        private const int WmRButtonDown = 0x0204;
+        private const int WmMButtonDown = 0x0207;
+        private IntPtr _mouseHookId = IntPtr.Zero;
+        private readonly LowLevelKeyboardProc _mouseProc;
+
+        private IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0 && _settings.ConvertEnabled)
+            {
+                int msg = wParam.ToInt32();
+                if (msg == WmLButtonDown || msg == WmRButtonDown || msg == WmMButtonDown)
+                {
+                    try
+                    {
+                        if (!IsConsoleWindow(GetForegroundWindow())) ClearTrackedWord();
+                    }
+                    catch { }
+                }
+            }
+            return CallNextHookEx(_mouseHookId, nCode, wParam, lParam);
         }
 
         private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -560,6 +618,9 @@ namespace LayoutGlow
                 {
                     bool isDown = msg == WmKeyDown || msg == WmSysKeyDown;
                     bool isUp = msg == WmKeyUp || msg == WmSysKeyUp;
+                    // Never let tracking code kill the hook.
+                    try { TrackModifiers(data.VkCode, isDown, isUp); } catch { }
+                    try { TrackLayoutHotkey(data.VkCode, isDown, isUp); } catch { }
                     if (data.VkCode == VkLShift)
                     {
                         if (isUp)
@@ -570,10 +631,13 @@ namespace LayoutGlow
                             {
                                 _lastLShiftUp = DateTime.MinValue;
                                 _otherKeySinceLastShift = true;
+                                BloodyBacklight.Log("hook: double-tap");
                                 TriggerConvert();
                             }
                             else
                             {
+                                if (elapsed >= 40 && elapsed <= _settings.DoubleTapMs + 600)
+                                    BloodyBacklight.Log("hook: near-miss (" + (_otherKeySinceLastShift ? "other key" : "slow tap") + ", " + (int)elapsed + "ms)");
                                 _lastLShiftUp = now;
                                 _otherKeySinceLastShift = false;
                             }
@@ -582,6 +646,7 @@ namespace LayoutGlow
                     else if (isDown)
                     {
                         _otherKeySinceLastShift = true;
+                        try { TrackTypedChar(data); } catch { }
                     }
                 }
             }
@@ -606,6 +671,205 @@ namespace LayoutGlow
             });
         }
 
+        // ---- typed-word tracking ----
+        private const int VkBack = 0x08;
+        private const int VkTab = 0x09;
+        private const int VkReturn = 0x0D;
+        private const int VkEscape = 0x1B;
+        private const int VkSpace = 0x20;
+        private const int VkCapital = 0x14;
+        private const int VkRShift = 0xA1;
+        private const int VkLControl = 0xA2;
+        private const int VkRControl = 0xA3;
+        private const int VkLMenu = 0xA4;
+        private const int VkRMenu = 0xA5;
+
+        private void TrackModifiers(uint vk, bool isDown, bool isUp)
+        {
+            if (vk == VkLShift || vk == VkRShift || vk == 0x10)
+            {
+                if (isDown) _shiftDown = true;
+                if (isUp) _shiftDown = false;
+            }
+            else if (vk == VkLControl || vk == VkRControl || vk == 0x11)
+            {
+                if (isDown) _ctrlDown = true;
+                if (isUp) _ctrlDown = false;
+            }
+            else if (vk == VkLMenu || vk == VkRMenu || vk == 0x12)
+            {
+                if (isDown) _altDown = true;
+                if (isUp) _altDown = false;
+            }
+            else if (vk == VkCapital && isDown)
+            {
+                _capsOn = !_capsOn;
+            }
+        }
+
+        // ---- layout-switch hotkey tracking ----
+        // Console windows report HKL=0 and ignore WM_INPUTLANGCHANGEREQUEST, so for
+        // them the real layout is unreadable. We track the system toggle hotkeys
+        // (Ctrl+Shift / Alt+Shift / Win+Space) ourselves; regular windows re-sync
+        // this state from their HKL on every poll, so it stays self-correcting.
+        private bool _winDown;
+        private bool _toggleComboFired;
+        private bool _trackedRussian;
+        private readonly object _layoutLock = new object();
+
+        public bool TrackedRussian
+        {
+            get { lock (_layoutLock) return _trackedRussian; }
+        }
+
+        public void SyncTrackedRussian(bool rus)
+        {
+            lock (_layoutLock) _trackedRussian = rus;
+        }
+
+        private void ToggleTrackedRussian(string why)
+        {
+            lock (_layoutLock) _trackedRussian = !_trackedRussian;
+            BloodyBacklight.Log("layout: toggle by " + why + " -> " + (_trackedRussian ? "RU" : "EN"));
+        }
+
+        private void TrackLayoutHotkey(uint vk, bool isDown, bool isUp)
+        {
+            if (vk == 0x5B || vk == 0x5C) // LWIN/RWIN
+            {
+                if (isDown) _winDown = true;
+                if (isUp) { _winDown = false; _toggleComboFired = false; }
+                return;
+            }
+            bool isShift = vk == VkLShift || vk == VkRShift || vk == 0x10;
+            bool isCtrl = vk == VkLControl || vk == VkRControl || vk == 0x11;
+            bool isAlt = vk == VkLMenu || vk == VkRMenu || vk == 0x12;
+            if (isUp)
+            {
+                if (isShift || isCtrl || isAlt || vk == VkSpace) _toggleComboFired = false;
+                return;
+            }
+            if (!isDown || _toggleComboFired) return;
+            bool combo =
+                (isShift && (_ctrlDown || _altDown)) ||
+                (isCtrl && _shiftDown) ||
+                (isAlt && _shiftDown) ||
+                (vk == VkSpace && _winDown);
+            if (combo)
+            {
+                _toggleComboFired = true;
+                ToggleTrackedRussian("hotkey");
+            }
+        }
+
+        private void TrackTypedChar(KbdLlHookStruct data)
+        {
+            uint vk = data.VkCode;
+            if (vk == VkBack)
+            {
+                lock (_wordLock) { if (_word.Length > 0) _word.Length--; }
+                return;
+            }
+            // word boundaries / caret moves invalidate the tracked word
+            if (vk == VkSpace || vk == VkReturn || vk == VkTab || vk == VkEscape ||
+                vk == VkLeft || vk == 0x27 || vk == 0x26 || vk == 0x28 ||       // left/right/up/down
+                vk == 0x23 || vk == 0x24 || vk == 0x21 || vk == 0x22 ||         // end/home/pgup/pgdn
+                vk == 0x2E || vk == 0x2D)                                       // del/ins
+            {
+                lock (_wordLock) _word.Length = 0;
+                return;
+            }
+            if (_ctrlDown || _altDown) return; // shortcuts are not text
+
+            var hwnd = GetForegroundWindow();
+            uint pid;
+            uint tid = GetWindowThreadProcessId(hwnd, out pid);
+            IntPtr hkl;
+            if (IsConsoleWindow(hwnd))
+            {
+                // Console threads report HKL=0: translate keys using the layout
+                // we track ourselves (toggle hotkeys / our own conversions).
+                hkl = TrackedRussian ? GetRuHkl() : GetEnHkl();
+            }
+            else
+            {
+                hkl = GetKeyboardLayout(tid);
+            }
+            var state = new byte[256];
+            if (_shiftDown) state[0x10] = 0x80;
+            if (_ctrlDown) state[0x11] = 0x80;
+            if (_capsOn) state[VkCapital] = 0x01;
+            var sb = new StringBuilder(4);
+            int n = ToUnicodeEx(vk, data.ScanCode, state, sb, sb.Capacity, 0, hkl);
+            if (n >= 1)
+            {
+                char c = sb[0];
+                if (c >= 0x20)
+                {
+                    lock (_wordLock)
+                    {
+                        if (_word.Length >= MaxWordLen) _word.Remove(0, 1);
+                        _word.Append(c);
+                    }
+                }
+            }
+        }
+
+        // Called periodically by the tray timer: clears the tracked word on focus change.
+        public void NoteForeground()
+        {
+            var hwnd = GetForegroundWindow();
+            if (hwnd != _lastForeground)
+            {
+                _lastForeground = hwnd;
+                lock (_wordLock) _word.Length = 0;
+            }
+        }
+
+        private string TakeTrackedWord()
+        {
+            lock (_wordLock)
+            {
+                string w = _word.ToString();
+                _word.Length = 0;
+                return w;
+            }
+        }
+
+        private void ClearTrackedWord()
+        {
+            lock (_wordLock) _word.Length = 0;
+        }
+
+        // Explicitly loaded layout handles for console key translation.
+        private static IntPtr _enHkl = IntPtr.Zero;
+        private static IntPtr _ruHkl = IntPtr.Zero;
+        private const uint KlfNotellshell = 0x00000080;
+
+        private static IntPtr GetEnHkl()
+        {
+            if (_enHkl == IntPtr.Zero) _enHkl = LoadKeyboardLayout("00000409", KlfNotellshell);
+            return _enHkl;
+        }
+
+        private static IntPtr GetRuHkl()
+        {
+            if (_ruHkl == IntPtr.Zero) _ruHkl = LoadKeyboardLayout("00000419", KlfNotellshell);
+            return _ruHkl;
+        }
+
+        // After a conversion the converted word becomes the new "last typed word",
+        // so a repeated double-tap toggles it back (Caramba-style).
+        private void SeedTrackedWord(string word)
+        {
+            lock (_wordLock)
+            {
+                _word.Length = 0;
+                if (!String.IsNullOrEmpty(word) && word.Length <= MaxWordLen)
+                    _word.Append(word);
+            }
+        }
+
         // Scan-code based injection: arrows are extended keys and are ignored by many
         // apps when synthesized by virtual-key code alone. Physical-like delivery requires
         // KEYEVENTF_SCANCODE (+ KEYEVENTF_EXTENDEDKEY for arrows etc.).
@@ -621,6 +885,10 @@ namespace LayoutGlow
                 case VkC: scan = 0x2E; extended = false; return;
                 case VkV: scan = 0x2F; extended = false; return;
                 case VkLeft: scan = 0x4B; extended = true; return;
+                case VkBack: scan = 0x0E; extended = false; return;
+                case VkLMenu: scan = 0x38; extended = false; return;
+                case VkOem3: scan = 0x29; extended = false; return; // `~ key
+                case VkInsert: scan = 0x52; extended = true; return;
                 default: scan = 0; extended = false; return;
             }
         }
@@ -634,6 +902,47 @@ namespace LayoutGlow
             for (int i = keys.Length - 1; i >= 0; i--) inputs.Add(KeyUp(keys[i]));
             if (shift) inputs.Add(KeyUp(VkLShift));
             if (ctrl) inputs.Add(KeyUp(VkControl));
+            SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf(typeof(Input)));
+        }
+
+        private const int VkOem3 = 0xC0; // `~ key (grave accent)
+        private const int VkInsert = 0x2D;
+
+        // Sends the real system layout-switch hotkey (read from the registry) as
+        // physical-like input. Needed for consoles, which ignore
+        // WM_INPUTLANGCHANGEREQUEST but do react to the actual hotkey.
+        private static void SendLayoutToggleHotkey()
+        {
+            string hk = "1";
+            try
+            {
+                var v = Registry.GetValue("HKEY_CURRENT_USER\\Keyboard Layout\\Toggle", "Hotkey", null);
+                if (v != null) hk = v.ToString();
+            }
+            catch { }
+            switch (hk)
+            {
+                case "1": // Left Alt + Shift
+                    SendModifiersPulse(VkLMenu, VkLShift);
+                    break;
+                case "2": // Ctrl + Shift
+                    SendModifiersPulse(VkControl, VkLShift);
+                    break;
+                case "4": // grave accent
+                    SendKeyCombo(false, false, VkOem3);
+                    break;
+                // "3" = disabled: nothing to send
+            }
+        }
+
+        private static void SendModifiersPulse(int mod1, int mod2)
+        {
+            var inputs = new List<Input>();
+            inputs.Add(KeyDown(mod1));
+            inputs.Add(KeyDown(mod2));
+            Thread.Sleep(30);
+            inputs.Add(KeyUp(mod2));
+            inputs.Add(KeyUp(mod1));
             SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf(typeof(Input)));
         }
 
@@ -709,44 +1018,196 @@ namespace LayoutGlow
             return cur;
         }
 
+        private const uint KeyeventfUnicode = 0x0004;
+
+        // Types text layout-independently via KEYEVENTF_UNICODE (works in consoles too).
+        private static void TypeUnicodeText(string text)
+        {
+            var inputs = new List<Input>(text.Length * 2);
+            foreach (char c in text)
+            {
+                var down = new Input();
+                down.Type = 1;
+                down.U.Ki.WScan = c;
+                down.U.Ki.DwFlags = KeyeventfUnicode;
+                inputs.Add(down);
+                var up = new Input();
+                up.Type = 1;
+                up.U.Ki.WScan = c;
+                up.U.Ki.DwFlags = KeyeventfUnicode | KeyeventfKeyup;
+                inputs.Add(up);
+            }
+            if (inputs.Count > 0)
+                SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf(typeof(Input)));
+        }
+
+        private static void SendBackspaces(int count)
+        {
+            var inputs = new List<Input>(count * 2);
+            for (int i = 0; i < count; i++)
+            {
+                inputs.Add(KeyDown(VkBack));
+                inputs.Add(KeyUp(VkBack));
+            }
+            if (inputs.Count > 0)
+                SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf(typeof(Input)));
+        }
+
+        private static string ClassNameOf(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return "";
+            var sb = new StringBuilder(256);
+            GetClassName(hwnd, sb, sb.Capacity);
+            return sb.ToString();
+        }
+
+        private static bool IsConsoleClass(string cls)
+        {
+            return cls == "ConsoleWindowClass" ||              // classic conhost (cmd, PowerShell)
+                   cls == "CASCADIA_HOSTING_WINDOW_CLASS" || // Windows Terminal
+                   cls == "PseudoConsoleWindow";
+        }
+
+        private static bool IsConsoleWindow(IntPtr hwnd)
+        {
+            return IsConsoleClass(ClassNameOf(hwnd));
+        }
+
+        // GUI terminal emulators: no console HKL quirks, but Ctrl+C means SIGINT
+        // there and Unicode key injection is mangled — treat like consoles for
+        // conversion purposes (word erase + paste), keep normal HKL polling.
+        private static bool IsTerminalClass(string cls)
+        {
+            return IsConsoleClass(cls) ||
+                   cls == "mintty" ||             // Git Bash / Cygwin / MSYS2
+                   cls == "VirtualConsoleClass";  // ConEmu / Cmder
+        }
+
+        public static bool IsConsoleForeground()
+        {
+            return IsConsoleWindow(GetForegroundWindow());
+        }
+
+        private void FinishConvert(bool console)
+        {
+            if (_settings.SwitchLayoutAfterConvert)
+            {
+                var hwnd = GetForegroundWindow();
+                if (hwnd != IntPtr.Zero)
+                {
+                    if (console)
+                    {
+                        Thread.Sleep(120); // let the console digest the retyped text first
+                        SendLayoutToggleHotkey(); // consoles ignore WM_INPUTLANGCHANGEREQUEST
+                    }
+                    else
+                    {
+                        PostMessage(hwnd, WmInputLangChangeRequest, new IntPtr(2), IntPtr.Zero);
+                    }
+                    ToggleTrackedRussian("convert");
+                }
+            }
+            var cb = _onConverted;
+            if (cb != null) cb();
+        }
+
+        // Types text by pasting it via Shift+Insert. Works in editors, consoles
+        // and terminal emulators alike, and unlike KEYEVENTF_UNICODE injection it
+        // is not mangled by terminals (mintty/ConEmu break VK_PACKET chars).
+        private static void PasteText(string text)
+        {
+            SetClipboardText(text);
+            Thread.Sleep(50);
+            SendKeyCombo(false, true, VkInsert); // Shift+Insert = paste everywhere
+        }
+
         private void DoConvert()
         {
-            uint seqBefore = GetClipboardSequenceNumber();
-            string clipBefore = GetClipboardTextWithRetries();
+            var fg = GetForegroundWindow();
+            string fgClass = ClassNameOf(fg);
+            bool console = IsConsoleClass(fgClass);
+            bool terminal = IsTerminalClass(fgClass);
+            BloodyBacklight.Log("convert: fg=\"" + fgClass + "\" console=" + console + " terminal=" + terminal);
 
-            SendKeyCombo(true, false, VkC);
-            uint seqAfter = WaitClipboardChange(seqBefore, 400);
-            string selected = seqAfter != seqBefore ? GetClipboardTextWithRetries() : null;
-
-            if (String.IsNullOrEmpty(selected))
+            if (!terminal)
             {
-                // nothing selected -> select last word and copy again
+                // 1) selection-based conversion via clipboard (editors etc.)
+                uint seqBefore = GetClipboardSequenceNumber();
+                string clipBefore = GetClipboardTextWithRetries();
+
+                SendKeyCombo(true, false, VkC);
+                uint seqAfter = WaitClipboardChange(seqBefore, 400);
+                string selected = seqAfter != seqBefore ? GetClipboardTextWithRetries() : null;
+                BloodyBacklight.Log("convert: path1 sel=" + (selected == null ? "null" : "\"" + selected + "\""));
+
+                if (!String.IsNullOrEmpty(selected))
+                {
+                    string convertedSel = TextConverter.Convert(selected);
+                    SetClipboardText(convertedSel);
+                    SendKeyCombo(true, false, VkV);
+                    Thread.Sleep(150);
+                    RestoreClipboard(clipBefore); // keep user's clipboard untouched
+                    TakeTrackedWord();
+                    FinishConvert(console);
+                    return;
+                }
+
+                // 2) no selection -> convert the tracked last-typed word by erasing
+                //    and pasting it back converted (no selection flicker).
+                string tracked = TakeTrackedWord();
+                BloodyBacklight.Log("convert: word=\"" + tracked + "\"");
+                if (tracked.Length > 0)
+                {
+                    string convertedTracked = TextConverter.Convert(tracked);
+                    SendBackspaces(tracked.Length);
+                    Thread.Sleep(80);
+                    PasteText(convertedTracked);
+                    Thread.Sleep(150);
+                    RestoreClipboard(clipBefore);
+                    SeedTrackedWord(convertedTracked);
+                    FinishConvert(console);
+                    return;
+                }
+
+                // 3) fallback (e.g., caret placed by mouse, nothing tracked):
+                //    synthesize a word selection and copy it.
                 SendKeyCombo(true, true, VkLeft);
                 Thread.Sleep(150); // let the app apply the synthetic selection
                 SendKeyCombo(true, false, VkC);
                 uint seqAfter2 = WaitClipboardChange(seqAfter, 500);
                 selected = seqAfter2 != seqAfter ? GetClipboardTextWithRetries() : null;
-                if (String.IsNullOrEmpty(selected))
+                BloodyBacklight.Log("convert: path2 sel=" + (selected == null ? "null" : "\"" + selected + "\""));
+                if (!String.IsNullOrEmpty(selected))
                 {
+                    string convertedWord = TextConverter.Convert(selected);
+                    SetClipboardText(convertedWord);
+                    SendKeyCombo(true, false, VkV);
+                    Thread.Sleep(150);
                     RestoreClipboard(clipBefore);
+                    SeedTrackedWord(convertedWord);
+                    FinishConvert(console);
                     return;
                 }
+                RestoreClipboard(clipBefore);
+                return;
             }
 
-            string converted = TextConverter.Convert(selected);
-            SetClipboardText(converted);
-            SendKeyCombo(true, false, VkV);
-            Thread.Sleep(150);
-            RestoreClipboard(clipBefore); // keep user's clipboard untouched
-
-            if (_settings.SwitchLayoutAfterConvert)
+            // Terminal/console path: erase the tracked last-typed word and paste it
+            // back converted. No Ctrl+C here — in terminals that means SIGINT.
+            string word = TakeTrackedWord();
+            BloodyBacklight.Log("convert: terminal word=\"" + word + "\"");
+            if (word.Length > 0)
             {
-                var hwnd = GetForegroundWindow();
-                if (hwnd != IntPtr.Zero)
-                    PostMessage(hwnd, WmInputLangChangeRequest, new IntPtr(2), IntPtr.Zero);
+                string clipBeforeT = GetClipboardTextWithRetries();
+                string converted = TextConverter.Convert(word);
+                SendBackspaces(word.Length);
+                Thread.Sleep(80);
+                PasteText(converted);
+                Thread.Sleep(150);
+                RestoreClipboard(clipBeforeT);
+                SeedTrackedWord(converted);
+                FinishConvert(console);
             }
-            var cb = _onConverted;
-            if (cb != null) cb();
         }
 
         private static void RestoreClipboard(string text)
@@ -773,6 +1234,7 @@ namespace LayoutGlow
         public TrayApp()
         {
             _settings = Settings.Load();
+            BloodyBacklight.LoggingEnabled = _settings.LogEnabled;
             _backlight = new BloodyBacklight();
             _engine = new ConvertEngine(_settings, OnConverted);
             _engine.Install();
@@ -812,11 +1274,25 @@ namespace LayoutGlow
 
         private void OnLayoutTick(object sender, EventArgs e)
         {
-            bool rus = LayoutInfo.IsRussianForeground();
+            _engine.NoteForeground(); // invalidate tracked word on focus change
+            bool isConsole = ConvertEngine.IsConsoleForeground();
+            bool rus;
+            if (isConsole)
+            {
+                // Consoles report HKL=0: use the state we track from toggle hotkeys.
+                rus = _engine.TrackedRussian;
+            }
+            else
+            {
+                rus = LayoutInfo.IsRussianForeground();
+                _engine.SyncTrackedRussian(rus); // authoritative source: keep tracker in sync
+            }
 
-            // Anti-flicker: accept a layout change only after it stays stable
-            // for 5 consecutive polls (~0.5 s). The foreground thread's HKL
-            // oscillates briefly while Windows switches layouts.
+            // Anti-flicker: accept a layout change only after it stays stable for
+            // a couple of polls (the foreground thread's HKL oscillates briefly
+            // while Windows switches layouts). The tracked console state is set
+            // digitally by us, so it needs no debounce at all.
+            int need = isConsole ? 1 : 2;
             if (_lastRussian.HasValue && _lastRussian.Value == rus)
             {
                 _pendingCount = 0;
@@ -831,16 +1307,19 @@ namespace LayoutGlow
                 _pendingRussian = rus;
                 _pendingCount = 1;
             }
-            if (_pendingCount < 5) return;
+            if (_pendingCount < need) return;
             _pendingCount = 0;
 
             _lastRussian = rus;
-            try
+            if (_settings.LogEnabled)
             {
-                File.AppendAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LayoutGlow.log"),
-                    DateTime.Now.ToString("HH:mm:ss.fff") + " layout=" + (rus ? "RU" : "EN") + Environment.NewLine);
+                try
+                {
+                    File.AppendAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LayoutGlow.log"),
+                        DateTime.Now.ToString("HH:mm:ss.fff") + " layout=" + (rus ? "RU" : "EN") + Environment.NewLine);
+                }
+                catch { }
             }
-            catch { }
             _tray.Icon = BuildIcon(rus);
             if (_settings.BacklightEnabled)
             {
