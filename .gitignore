@@ -1,0 +1,12 @@
+# build artifacts
+/LayoutGlow.exe
+*.pdb
+
+# runtime files
+LayoutGlow.ini
+LayoutGlow.log
+
+# IDE
+.vs/
+bin/
+obj/
