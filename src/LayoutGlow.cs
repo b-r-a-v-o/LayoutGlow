@@ -606,6 +606,25 @@ namespace LayoutGlow
             });
         }
 
+        // Scan-code based injection: arrows are extended keys and are ignored by many
+        // apps when synthesized by virtual-key code alone. Physical-like delivery requires
+        // KEYEVENTF_SCANCODE (+ KEYEVENTF_EXTENDEDKEY for arrows etc.).
+        private const uint KeyeventfScancode = 0x0008;
+        private const uint KeyeventfExtendedkey = 0x0001;
+
+        private static void ScanFor(int vk, out ushort scan, out bool extended)
+        {
+            switch (vk)
+            {
+                case VkControl: scan = 0x1D; extended = false; return;
+                case VkLShift: scan = 0x2A; extended = false; return;
+                case VkC: scan = 0x2E; extended = false; return;
+                case VkV: scan = 0x2F; extended = false; return;
+                case VkLeft: scan = 0x4B; extended = true; return;
+                default: scan = 0; extended = false; return;
+            }
+        }
+
         private static void SendKeyCombo(bool ctrl, bool shift, params int[] keys)
         {
             var inputs = new List<Input>();
@@ -620,19 +639,23 @@ namespace LayoutGlow
 
         private static Input KeyDown(int vk)
         {
+            ushort scan; bool ext;
+            ScanFor(vk, out scan, out ext);
             var i = new Input();
             i.Type = 1;
-            i.U.Ki.WVk = (ushort)vk;
-            i.U.Ki.DwFlags = 0;
+            i.U.Ki.WScan = scan;
+            i.U.Ki.DwFlags = KeyeventfScancode | (ext ? KeyeventfExtendedkey : 0u);
             return i;
         }
 
         private static Input KeyUp(int vk)
         {
+            ushort scan; bool ext;
+            ScanFor(vk, out scan, out ext);
             var i = new Input();
             i.Type = 1;
-            i.U.Ki.WVk = (ushort)vk;
-            i.U.Ki.DwFlags = KeyeventfKeyup;
+            i.U.Ki.WScan = scan;
+            i.U.Ki.DwFlags = KeyeventfScancode | KeyeventfKeyup | (ext ? KeyeventfExtendedkey : 0u);
             return i;
         }
 
@@ -673,24 +696,35 @@ namespace LayoutGlow
             t.Join(1500);
         }
 
+        // Waits until the clipboard sequence number changes (copy landed) or timeout.
+        private static uint WaitClipboardChange(uint seq, int timeoutMs)
+        {
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            uint cur;
+            do
+            {
+                Thread.Sleep(40);
+                cur = GetClipboardSequenceNumber();
+            } while (cur == seq && DateTime.UtcNow < deadline);
+            return cur;
+        }
+
         private void DoConvert()
         {
             uint seqBefore = GetClipboardSequenceNumber();
             string clipBefore = GetClipboardTextWithRetries();
 
             SendKeyCombo(true, false, VkC);
-            Thread.Sleep(180);
-            uint seqAfter = GetClipboardSequenceNumber();
+            uint seqAfter = WaitClipboardChange(seqBefore, 400);
             string selected = seqAfter != seqBefore ? GetClipboardTextWithRetries() : null;
 
             if (String.IsNullOrEmpty(selected))
             {
                 // nothing selected -> select last word and copy again
                 SendKeyCombo(true, true, VkLeft);
-                Thread.Sleep(60);
+                Thread.Sleep(150); // let the app apply the synthetic selection
                 SendKeyCombo(true, false, VkC);
-                Thread.Sleep(180);
-                uint seqAfter2 = GetClipboardSequenceNumber();
+                uint seqAfter2 = WaitClipboardChange(seqAfter, 500);
                 selected = seqAfter2 != seqAfter ? GetClipboardTextWithRetries() : null;
                 if (String.IsNullOrEmpty(selected))
                 {
