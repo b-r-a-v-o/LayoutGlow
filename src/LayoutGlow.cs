@@ -434,7 +434,7 @@ namespace LayoutGlow
             bool hasCyrillic = false;
             foreach (char c in text)
             {
-                if (RuToEn.ContainsKey(c)) { hasCyrillic = true; break; }
+                if (IsCyrillic(c)) { hasCyrillic = true; break; }
             }
             var map = hasCyrillic ? RuToEn : EnToRu;
             var sb = new StringBuilder(text.Length);
@@ -444,6 +444,13 @@ namespace LayoutGlow
                 sb.Append(map.TryGetValue(c, out mapped) ? mapped : c);
             }
             return sb.ToString();
+        }
+
+        // RuToEn keys also include RU punctuation (?, ,, ., ;, :, "), so
+        // dictionary membership cannot detect Cyrillic — check the range.
+        private static bool IsCyrillic(char c)
+        {
+            return (c >= '\u0410' && c <= '\u044F') || c == '\u0401' || c == '\u0451';
         }
     }
 
@@ -530,6 +537,25 @@ namespace LayoutGlow
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr LoadKeyboardLayout(string pwszKLID, uint Flags);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
         [DllImport("user32.dll")] private static extern short GetKeyState(int nVirtKey);
+        [DllImport("user32.dll", SetLastError = true)] private static extern bool GetGUIThreadInfo(uint idThread, ref GuiThreadInfo info);
+        [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Rect { public int Left, Top, Right, Bottom; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct GuiThreadInfo
+        {
+            public int CbSize;
+            public uint Flags;
+            public IntPtr HwndActive;
+            public IntPtr HwndFocus;
+            public IntPtr HwndCapture;
+            public IntPtr HwndMenuOwner;
+            public IntPtr HwndMoveSize;
+            public IntPtr HwndCaret;
+            public Rect RcCaret;
+        }
 
         private readonly Settings _settings;
         private readonly Action _onConverted;
@@ -1088,6 +1114,31 @@ namespace LayoutGlow
             return IsConsoleWindow(GetForegroundWindow());
         }
 
+        // Scintilla-based editors (Notepad++, SciTE): Ctrl+C with an EMPTY
+        // selection copies the whole current line, so the clipboard change in
+        // path 1 cannot be trusted as "the user selected something". Ask
+        // Scintilla directly whether a real selection exists (messages
+        // SCI_GETSELECTIONSTART/END work cross-process via SendMessage).
+        private const int SciGetSelectionStart = 2143;
+        private const int SciGetSelectionEnd = 2145;
+
+        private static bool IsScintillaEmptySelection()
+        {
+            var hwnd = GetForegroundWindow();
+            if (hwnd == IntPtr.Zero) return false;
+            uint pid;
+            uint tid = GetWindowThreadProcessId(hwnd, out pid);
+            var info = new GuiThreadInfo();
+            info.CbSize = Marshal.SizeOf(typeof(GuiThreadInfo));
+            if (!GetGUIThreadInfo(tid, ref info)) return false;
+            var focus = info.HwndFocus;
+            if (focus == IntPtr.Zero) return false;
+            if (ClassNameOf(focus) != "Scintilla") return false;
+            long start = SendMessage(focus, SciGetSelectionStart, IntPtr.Zero, IntPtr.Zero).ToInt64();
+            long end = SendMessage(focus, SciGetSelectionEnd, IntPtr.Zero, IntPtr.Zero).ToInt64();
+            return start == end;
+        }
+
         private void FinishConvert(bool console)
         {
             if (_settings.SwitchLayoutAfterConvert)
@@ -1132,24 +1183,40 @@ namespace LayoutGlow
             if (!terminal)
             {
                 // 1) selection-based conversion via clipboard (editors etc.)
-                uint seqBefore = GetClipboardSequenceNumber();
-                string clipBefore = GetClipboardTextWithRetries();
+                //    Skipped when a Scintilla editor reports an empty selection:
+                //    its Ctrl+C would copy the whole line, not a selection.
+                bool skipSelectionPath = IsScintillaEmptySelection();
+                if (skipSelectionPath)
+                    BloodyBacklight.Log("convert: scintilla empty selection, skipping path1");
 
-                SendKeyCombo(true, false, VkC);
-                uint seqAfter = WaitClipboardChange(seqBefore, 400);
-                string selected = seqAfter != seqBefore ? GetClipboardTextWithRetries() : null;
-                BloodyBacklight.Log("convert: path1 sel=" + (selected == null ? "null" : "\"" + selected + "\""));
-
-                if (!String.IsNullOrEmpty(selected))
+                string clipBefore = null;
+                uint seqAfter = 0;
+                if (!skipSelectionPath)
                 {
-                    string convertedSel = TextConverter.Convert(selected);
-                    SetClipboardText(convertedSel);
-                    SendKeyCombo(true, false, VkV);
-                    Thread.Sleep(150);
-                    RestoreClipboard(clipBefore); // keep user's clipboard untouched
-                    TakeTrackedWord();
-                    FinishConvert(console);
-                    return;
+                    uint seqBefore = GetClipboardSequenceNumber();
+                    clipBefore = GetClipboardTextWithRetries();
+
+                    SendKeyCombo(true, false, VkC);
+                    seqAfter = WaitClipboardChange(seqBefore, 400);
+                    string selected = seqAfter != seqBefore ? GetClipboardTextWithRetries() : null;
+                    BloodyBacklight.Log("convert: path1 sel=" + (selected == null ? "null" : "\"" + selected + "\""));
+
+                    if (!String.IsNullOrEmpty(selected))
+                    {
+                        string convertedSel = TextConverter.Convert(selected);
+                        SetClipboardText(convertedSel);
+                        SendKeyCombo(true, false, VkV);
+                        Thread.Sleep(150);
+                        RestoreClipboard(clipBefore); // keep user's clipboard untouched
+                        TakeTrackedWord();
+                        FinishConvert(console);
+                        return;
+                    }
+                }
+                else
+                {
+                    clipBefore = GetClipboardTextWithRetries();
+                    seqAfter = GetClipboardSequenceNumber(); // path 3 below compares against this
                 }
 
                 // 2) no selection -> convert the tracked last-typed word by erasing
@@ -1175,11 +1242,11 @@ namespace LayoutGlow
                 Thread.Sleep(150); // let the app apply the synthetic selection
                 SendKeyCombo(true, false, VkC);
                 uint seqAfter2 = WaitClipboardChange(seqAfter, 500);
-                selected = seqAfter2 != seqAfter ? GetClipboardTextWithRetries() : null;
-                BloodyBacklight.Log("convert: path2 sel=" + (selected == null ? "null" : "\"" + selected + "\""));
-                if (!String.IsNullOrEmpty(selected))
+                string selected3 = seqAfter2 != seqAfter ? GetClipboardTextWithRetries() : null;
+                BloodyBacklight.Log("convert: path2 sel=" + (selected3 == null ? "null" : "\"" + selected3 + "\""));
+                if (!String.IsNullOrEmpty(selected3))
                 {
-                    string convertedWord = TextConverter.Convert(selected);
+                    string convertedWord = TextConverter.Convert(selected3);
                     SetClipboardText(convertedWord);
                     SendKeyCombo(true, false, VkV);
                     Thread.Sleep(150);
