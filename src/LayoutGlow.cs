@@ -160,6 +160,22 @@ namespace LayoutGlow
             }
         }
 
+        // Called when Windows reports the keyboard re-attached (WM_DEVICECHANGE).
+        // The firmware forgets the command-channel handshake on power cycle,
+        // so the next send must start with the full init again.
+        public void NotifyDeviceArrived()
+        {
+            lock (_sync)
+            {
+                if (_initialized)
+                {
+                    _initialized = false;
+                    _dirty = true; // re-send init + color on the next worker tick
+                    Log("backlight: device arrival, re-init scheduled");
+                }
+            }
+        }
+
         private void WorkerLoop()
         {
             while (!_disposed)
@@ -209,7 +225,7 @@ namespace LayoutGlow
             {
                 if (!_initialized)
                 {
-                    SendReports(handle, BuildInitReports(), 8);
+                    SendReports(handle, BuildInitReports(), 8, true);
                     _initialized = true;
                     Log("backlight: init sent");
                 }
@@ -224,14 +240,33 @@ namespace LayoutGlow
             }
         }
 
-        private static void SendReports(SafeFileHandle handle, IEnumerable<byte[]> reports, int delayMs)
+        private static void SendReports(SafeFileHandle handle, IEnumerable<byte[]> reports, int delayMs, bool readBack = false)
         {
+            var readBuf = new byte[ReportLength];
             foreach (var report in reports)
             {
                 if (!HidD_SetFeature(handle, report, report.Length))
                     throw new Win32Exception(Marshal.GetLastWin32Error());
                 if (delayMs > 0) Thread.Sleep(delayMs);
+                if (readBack && NeedsReadback(report))
+                {
+                    Array.Clear(readBuf, 0, readBuf.Length);
+                    readBuf[0] = report[0];
+                    HidD_GetFeature(handle, readBuf, readBuf.Length); // handshake ack; result is not needed
+                    Thread.Sleep(2);
+                }
             }
+        }
+
+        // KeyDominator2 issues a GetFeature read-back after these init commands; without
+        // this handshake the firmware ignores the command channel after power-on
+        // (verified by USB boot capture, 09.11.2026).
+        private static bool NeedsReadback(byte[] report)
+        {
+            byte cmd = report[1];
+            if (cmd == 0x1F || cmd == 0x05 || cmd == 0x29 || cmd == 0x2A || cmd == 0x2F) return true;
+            if (cmd == 0x03 && report[2] == 0x06 && report[3] == 0x05) return true;
+            return false;
         }
 
         private static byte[] Packet(params byte[] prefix)
@@ -372,6 +407,7 @@ namespace LayoutGlow
         [DllImport("hid.dll")] private static extern bool HidD_FreePreparsedData(IntPtr preparsedData);
         [DllImport("hid.dll")] private static extern int HidP_GetCaps(IntPtr preparsedData, out HidpCaps capabilities);
         [DllImport("hid.dll", SetLastError = true)] private static extern bool HidD_SetFeature(SafeFileHandle handle, byte[] reportBuffer, int reportLength);
+        [DllImport("hid.dll", SetLastError = true)] private static extern bool HidD_GetFeature(SafeFileHandle handle, byte[] reportBuffer, int reportLength);
     }
 
     // ---------------- Input layout monitor ----------------
@@ -1286,6 +1322,8 @@ namespace LayoutGlow
     // ---------------- Tray application ----------------
     internal sealed class TrayApp : ApplicationContext
     {
+        public const string Version = "0.4.0";
+
         private readonly NotifyIcon _tray;
         private readonly Settings _settings;
         private readonly BloodyBacklight _backlight;
@@ -1295,6 +1333,7 @@ namespace LayoutGlow
         private readonly ToolStripMenuItem _miConvert;
         private readonly ToolStripMenuItem _miBacklight;
         private readonly ToolStripMenuItem _miAutostart;
+        private readonly DeviceNotifyWindow _devNotify;
         private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string RunValueName = "LayoutGlow";
 
@@ -1314,6 +1353,8 @@ namespace LayoutGlow
             _miAutostart.Checked = IsAutostart();
 
             var menu = new ContextMenuStrip();
+            menu.Items.Add(new ToolStripMenuItem("LayoutGlow v" + Version) { Enabled = false });
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(_miConvert);
             menu.Items.Add(_miBacklight);
             menu.Items.Add(new ToolStripSeparator());
@@ -1326,9 +1367,13 @@ namespace LayoutGlow
 
             _tray = new NotifyIcon();
             _tray.ContextMenuStrip = menu;
-            _tray.Text = "LayoutGlow: 2xLShift — смена раскладки";
+            _tray.Text = "LayoutGlow v" + Version + ": 2xLShift — смена раскладки";
             _tray.Icon = BuildIcon(false);
             _tray.Visible = true;
+
+            // Re-run the backlight handshake when Windows reports the keyboard re-attached
+            // (USB glitch, sleep/resume, replug) — the firmware forgets it on power cycle.
+            _devNotify = new DeviceNotifyWindow(OnDeviceArrival);
 
             _layoutTimer = new System.Windows.Forms.Timer();
             _layoutTimer.Interval = 100;
@@ -1497,9 +1542,107 @@ namespace LayoutGlow
         private void OnExit(object sender, EventArgs e)
         {
             _tray.Visible = false;
+            _devNotify.Dispose();
             _engine.Dispose();
             _backlight.Dispose();
             Application.Exit();
+        }
+
+        private void OnDeviceArrival(string devicePath)
+        {
+            // Empty path = generic devnodes-changed broadcast: re-init unconditionally
+            // (cheap, rare); a real path must belong to the Bloody keyboard.
+            if (String.IsNullOrEmpty(devicePath) ||
+                devicePath.ToLowerInvariant().Contains("pid_fa14"))
+            {
+                _backlight.NotifyDeviceArrived();
+            }
+        }
+
+        // Hidden window receiving WM_DEVICECHANGE for HID interface arrivals.
+        private sealed class DeviceNotifyWindow : NativeWindow
+        {
+            private const int WmDeviceChange = 0x0219;
+            private const int DbtDeviceArrival = 0x8000;
+            private const int DbtDevNodesChanged = 0x0007;
+            private const int DbtDevtypDeviceInterface = 0x00000005;
+            private static readonly Guid HidInterfaceGuid = new Guid("4D1E55B2-F16F-11CF-88CB-001111000030");
+
+            [StructLayout(LayoutKind.Sequential)]
+            private struct DevBroadcastDeviceInterface
+            {
+                public int Size;
+                public int DeviceType;
+                public int Reserved;
+                public Guid ClassGuid;
+                public short Name;
+            }
+
+            [DllImport("user32.dll", SetLastError = true)]
+            private static extern IntPtr RegisterDeviceNotification(IntPtr hRecipient, IntPtr notificationFilter, int flags);
+            [DllImport("user32.dll", SetLastError = true)]
+            private static extern bool UnregisterDeviceNotification(IntPtr handle);
+
+            private readonly Action<string> _onArrival;
+            private IntPtr _notifyHandle;
+
+            public DeviceNotifyWindow(Action<string> onArrival)
+            {
+                _onArrival = onArrival;
+                CreateHandle(new CreateParams());
+                var filter = new DevBroadcastDeviceInterface();
+                filter.Size = Marshal.SizeOf(typeof(DevBroadcastDeviceInterface));
+                filter.DeviceType = DbtDevtypDeviceInterface;
+                filter.ClassGuid = HidInterfaceGuid;
+                IntPtr buf = Marshal.AllocHGlobal(filter.Size);
+                try
+                {
+                    Marshal.StructureToPtr(filter, buf, false);
+                    _notifyHandle = RegisterDeviceNotification(Handle, buf, 0);
+                    if (_notifyHandle == IntPtr.Zero)
+                        BloodyBacklight.Log("devnotify: registration failed, err=" + Marshal.GetLastWin32Error());
+                    else
+                        BloodyBacklight.Log("devnotify: registered");
+                }
+                finally { Marshal.FreeHGlobal(buf); }
+            }
+
+            protected override void WndProc(ref Message m)
+            {
+                if (m.Msg == WmDeviceChange)
+                {
+                    int wp = (int)m.WParam;
+                    if (wp == DbtDeviceArrival)
+                    {
+                        try
+                        {
+                            // DEV_BROADCAST_DEVICEINTERFACE.dbcc_name starts at offset 28 (Unicode).
+                            string name = Marshal.PtrToStringUni(IntPtr.Add(m.LParam, 28));
+                            BloodyBacklight.Log("devnotify: arrival " + name);
+                            _onArrival(name);
+                        }
+                        catch { }
+                    }
+                    else if (wp == DbtDevNodesChanged)
+                    {
+                        // disable/enable of a devnode raises only this broadcast (no interface
+                        // arrival) — re-init unconditionally, it is cheap and rare.
+                        BloodyBacklight.Log("devnotify: devnodes changed");
+                        _onArrival("");
+                    }
+                }
+                base.WndProc(ref m);
+            }
+
+            public void Dispose()
+            {
+                if (_notifyHandle != IntPtr.Zero)
+                {
+                    UnregisterDeviceNotification(_notifyHandle);
+                    _notifyHandle = IntPtr.Zero;
+                }
+                DestroyHandle();
+            }
         }
     }
 
