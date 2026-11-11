@@ -467,17 +467,36 @@ namespace LayoutGlow
 
         public static string Convert(string text)
         {
-            bool hasCyrillic = false;
-            foreach (char c in text)
-            {
-                if (IsCyrillic(c)) { hasCyrillic = true; break; }
-            }
-            var map = hasCyrillic ? RuToEn : EnToRu;
+            // Direction is chosen per whitespace-delimited token, so mixed text
+            // like "привет vtldtlm" converts word by word: "ghbdtn медведь".
+            // Tokens containing Cyrillic go RU->EN, the rest EN->RU; whitespace
+            // between tokens is preserved as-is.
             var sb = new StringBuilder(text.Length);
-            foreach (char c in text)
+            int i = 0;
+            while (i < text.Length)
             {
-                char mapped;
-                sb.Append(map.TryGetValue(c, out mapped) ? mapped : c);
+                bool space = Char.IsWhiteSpace(text[i]);
+                int j = i;
+                while (j < text.Length && Char.IsWhiteSpace(text[j]) == space) j++;
+                if (space)
+                {
+                    sb.Append(text, i, j - i);
+                }
+                else
+                {
+                    bool hasCyrillic = false;
+                    for (int k = i; k < j; k++)
+                    {
+                        if (IsCyrillic(text[k])) { hasCyrillic = true; break; }
+                    }
+                    var map = hasCyrillic ? RuToEn : EnToRu;
+                    for (int k = i; k < j; k++)
+                    {
+                        char mapped;
+                        sb.Append(map.TryGetValue(text[k], out mapped) ? mapped : text[k]);
+                    }
+                }
+                i = j;
             }
             return sb.ToString();
         }
@@ -1322,7 +1341,7 @@ namespace LayoutGlow
     // ---------------- Tray application ----------------
     internal sealed class TrayApp : ApplicationContext
     {
-        public const string Version = "0.4.0";
+        public const string Version = "0.5.0";
 
         private readonly NotifyIcon _tray;
         private readonly Settings _settings;
