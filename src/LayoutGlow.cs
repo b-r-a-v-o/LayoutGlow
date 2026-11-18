@@ -11,6 +11,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Windows.Automation;
 using System.Windows.Forms;
 using Microsoft.Win32;
 using Microsoft.Win32.SafeHandles;
@@ -522,8 +523,8 @@ namespace LayoutGlow
         private const uint KeyeventfKeyup = 0x0002;
         private const int VkControl = 0x11;
         private const int VkC = 0x43;
-        private const int VkV = 0x56;
         private const int VkLeft = 0x25;
+        private const int VkRight = 0x27;
         private const int WmInputLangChangeRequest = 0x0050;
 
         private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
@@ -964,8 +965,8 @@ namespace LayoutGlow
                 case VkControl: scan = 0x1D; extended = false; return;
                 case VkLShift: scan = 0x2A; extended = false; return;
                 case VkC: scan = 0x2E; extended = false; return;
-                case VkV: scan = 0x2F; extended = false; return;
                 case VkLeft: scan = 0x4B; extended = true; return;
+                case VkRight: scan = 0x4D; extended = true; return;
                 case VkBack: scan = 0x0E; extended = false; return;
                 case VkLMenu: scan = 0x38; extended = false; return;
                 case VkOem3: scan = 0x29; extended = false; return; // `~ key
@@ -1169,15 +1170,38 @@ namespace LayoutGlow
             return IsConsoleWindow(GetForegroundWindow());
         }
 
-        // Scintilla-based editors (Notepad++, SciTE): Ctrl+C with an EMPTY
-        // selection copies the whole current line, so the clipboard change in
-        // path 1 cannot be trusted as "the user selected something". Ask
-        // Scintilla directly whether a real selection exists (messages
-        // SCI_GETSELECTIONSTART/END work cross-process via SendMessage).
+        // ---- selection probing ----
+        // UI Automation TextPattern: reads the current selection without
+        // sending any keystrokes (no clipboard, no Ctrl+C => no SIGINT in
+        // terminals). Returns null when UIA/TextPattern is unavailable for the
+        // focused element; "" when it works but nothing is selected.
+        private static string GetUiaSelectionText()
+        {
+            try
+            {
+                var el = AutomationElement.FocusedElement;
+                if (el == null) return null;
+                object patternObj;
+                if (!el.TryGetCurrentPattern(TextPattern.Pattern, out patternObj)) return null;
+                var ranges = ((TextPattern)patternObj).GetSelection();
+                if (ranges == null || ranges.Length == 0) return "";
+                var sb = new StringBuilder();
+                foreach (var range in ranges) sb.Append(range.GetText(-1));
+                return sb.ToString();
+            }
+            catch { return null; }
+        }
+
+        // Scintilla-based editors (Notepad++, SciTE) may ship without a UIA
+        // provider. Ask the control directly whether a real selection exists
+        // (messages SCI_GETSELECTIONSTART/END work cross-process via
+        // SendMessage). With a confirmed non-empty selection a clipboard read
+        // is safe: Scintilla is never a terminal, so Ctrl+C has no SIGINT
+        // semantics here.
         private const int SciGetSelectionStart = 2143;
         private const int SciGetSelectionEnd = 2145;
 
-        private static bool IsScintillaEmptySelection()
+        private static bool IsScintillaSelectionNonEmpty()
         {
             var hwnd = GetForegroundWindow();
             if (hwnd == IntPtr.Zero) return false;
@@ -1191,7 +1215,27 @@ namespace LayoutGlow
             if (ClassNameOf(focus) != "Scintilla") return false;
             long start = SendMessage(focus, SciGetSelectionStart, IntPtr.Zero, IntPtr.Zero).ToInt64();
             long end = SendMessage(focus, SciGetSelectionEnd, IntPtr.Zero, IntPtr.Zero).ToInt64();
-            return start == end;
+            return start != end;
+        }
+
+        // Reads the current selection via Ctrl+C. Call only when the selection
+        // is known to be non-empty and the target is not a terminal.
+        private static string CopySelectionViaClipboard()
+        {
+            uint seqBefore = GetClipboardSequenceNumber();
+            SendKeyCombo(true, false, VkC);
+            uint seqAfter = WaitClipboardChange(seqBefore, 400);
+            return seqAfter != seqBefore ? GetClipboardTextWithRetries() : null;
+        }
+
+        // Replaces the current selection with converted text via paste
+        // (Shift+Insert overwrites the selection), restoring the clipboard.
+        private static void ReplaceSelectionWith(string converted, string clipBefore)
+        {
+            if (clipBefore == null) clipBefore = GetClipboardTextWithRetries();
+            PasteText(converted);
+            Thread.Sleep(150);
+            RestoreClipboard(clipBefore);
         }
 
         private void FinishConvert(bool console)
@@ -1227,6 +1271,15 @@ namespace LayoutGlow
             SendKeyCombo(false, true, VkInsert); // Shift+Insert = paste everywhere
         }
 
+        // Conversion pipeline (universal, no blind Ctrl+C anywhere):
+        //  1) UI Automation reads a real selection without sending keystrokes.
+        //  2) Scintilla fallback: clipboard read, but only after the control
+        //     confirms a non-empty selection.
+        //  3) No selection: erase the tracked last-typed word and paste it back
+        //     converted (works in consoles/terminals: cmd, Windows Terminal,
+        //     mintty, ConEmu, MobaXterm).
+        //  4) Nothing tracked (e.g. caret placed by mouse): synthesize a word
+        //     selection with Ctrl+Shift+Left and read it back via UIA.
         private void DoConvert()
         {
             var fg = GetForegroundWindow();
@@ -1235,101 +1288,76 @@ namespace LayoutGlow
             bool terminal = IsTerminalClass(fgClass);
             BloodyBacklight.Log("convert: fg=\"" + fgClass + "\" console=" + console + " terminal=" + terminal);
 
-            if (!terminal)
+            // 1) Real selection via UI Automation.
+            var sw = Stopwatch.StartNew();
+            string sel = GetUiaSelectionText();
+            BloodyBacklight.Log("convert: uia sel=" + (sel == null ? "n/a" : "\"" + sel + "\"") +
+                                " (" + sw.ElapsedMilliseconds + "ms)");
+            if (!String.IsNullOrEmpty(sel))
             {
-                // 1) selection-based conversion via clipboard (editors etc.)
-                //    Skipped when a Scintilla editor reports an empty selection:
-                //    its Ctrl+C would copy the whole line, not a selection.
-                bool skipSelectionPath = IsScintillaEmptySelection();
-                if (skipSelectionPath)
-                    BloodyBacklight.Log("convert: scintilla empty selection, skipping path1");
+                ReplaceSelectionWith(TextConverter.Convert(sel), null);
+                TakeTrackedWord();
+                FinishConvert(console);
+                return;
+            }
 
-                string clipBefore = null;
-                uint seqAfter = 0;
-                if (!skipSelectionPath)
+            // 2) Scintilla without a UIA provider, but with a real selection.
+            if (sel == null && IsScintillaSelectionNonEmpty())
+            {
+                string clipBefore = GetClipboardTextWithRetries();
+                string scSel = CopySelectionViaClipboard();
+                BloodyBacklight.Log("convert: scintilla sel=" + (scSel == null ? "null" : "\"" + scSel + "\""));
+                if (!String.IsNullOrEmpty(scSel))
                 {
-                    uint seqBefore = GetClipboardSequenceNumber();
-                    clipBefore = GetClipboardTextWithRetries();
-
-                    SendKeyCombo(true, false, VkC);
-                    seqAfter = WaitClipboardChange(seqBefore, 400);
-                    string selected = seqAfter != seqBefore ? GetClipboardTextWithRetries() : null;
-                    BloodyBacklight.Log("convert: path1 sel=" + (selected == null ? "null" : "\"" + selected + "\""));
-
-                    if (!String.IsNullOrEmpty(selected))
-                    {
-                        string convertedSel = TextConverter.Convert(selected);
-                        SetClipboardText(convertedSel);
-                        SendKeyCombo(true, false, VkV);
-                        Thread.Sleep(150);
-                        RestoreClipboard(clipBefore); // keep user's clipboard untouched
-                        TakeTrackedWord();
-                        FinishConvert(console);
-                        return;
-                    }
-                }
-                else
-                {
-                    clipBefore = GetClipboardTextWithRetries();
-                    seqAfter = GetClipboardSequenceNumber(); // path 3 below compares against this
-                }
-
-                // 2) no selection -> convert the tracked last-typed word by erasing
-                //    and pasting it back converted (no selection flicker).
-                string tracked = TakeTrackedWord();
-                BloodyBacklight.Log("convert: word=\"" + tracked + "\"");
-                if (tracked.Length > 0)
-                {
-                    string convertedTracked = TextConverter.Convert(tracked);
-                    SendBackspaces(tracked.Length);
-                    Thread.Sleep(80);
-                    PasteText(convertedTracked);
-                    Thread.Sleep(150);
-                    RestoreClipboard(clipBefore);
-                    SeedTrackedWord(convertedTracked);
+                    ReplaceSelectionWith(TextConverter.Convert(scSel), clipBefore);
+                    TakeTrackedWord();
                     FinishConvert(console);
                     return;
                 }
+            }
 
-                // 3) fallback (e.g., caret placed by mouse, nothing tracked):
-                //    synthesize a word selection and copy it.
+            // 3) No selection -> convert the tracked last-typed word in place
+            //    (no selection flicker, works everywhere including terminals).
+            string tracked = TakeTrackedWord();
+            BloodyBacklight.Log("convert: word=\"" + tracked + "\"");
+            if (tracked.Length > 0)
+            {
+                string clipBefore = GetClipboardTextWithRetries();
+                string convertedTracked = TextConverter.Convert(tracked);
+                SendBackspaces(tracked.Length);
+                Thread.Sleep(80);
+                PasteText(convertedTracked);
+                Thread.Sleep(150);
+                RestoreClipboard(clipBefore);
+                SeedTrackedWord(convertedTracked);
+                FinishConvert(console);
+                return;
+            }
+
+            // 4) Fallback (caret placed by mouse, nothing tracked): synthesize
+            //    a word selection and read it back. Useless in terminals —
+            //    Ctrl+Shift+Left selects nothing there.
+            if (!terminal)
+            {
                 SendKeyCombo(true, true, VkLeft);
                 Thread.Sleep(150); // let the app apply the synthetic selection
-                SendKeyCombo(true, false, VkC);
-                uint seqAfter2 = WaitClipboardChange(seqAfter, 500);
-                string selected3 = seqAfter2 != seqAfter ? GetClipboardTextWithRetries() : null;
-                BloodyBacklight.Log("convert: path2 sel=" + (selected3 == null ? "null" : "\"" + selected3 + "\""));
-                if (!String.IsNullOrEmpty(selected3))
+                string sel3 = GetUiaSelectionText();
+                if (sel3 == null && IsScintillaSelectionNonEmpty())
+                    sel3 = CopySelectionViaClipboard();
+                BloodyBacklight.Log("convert: synth sel=" + (sel3 == null ? "n/a" : "\"" + sel3 + "\""));
+                if (!String.IsNullOrEmpty(sel3))
                 {
-                    string convertedWord = TextConverter.Convert(selected3);
-                    SetClipboardText(convertedWord);
-                    SendKeyCombo(true, false, VkV);
-                    Thread.Sleep(150);
-                    RestoreClipboard(clipBefore);
+                    string convertedWord = TextConverter.Convert(sel3);
+                    ReplaceSelectionWith(convertedWord, null);
                     SeedTrackedWord(convertedWord);
                     FinishConvert(console);
                     return;
                 }
-                RestoreClipboard(clipBefore);
-                return;
+                // Nothing readable under the caret: collapse the synthetic
+                // selection back to where the caret was.
+                SendKeyCombo(false, false, VkRight);
             }
-
-            // Terminal/console path: erase the tracked last-typed word and paste it
-            // back converted. No Ctrl+C here — in terminals that means SIGINT.
-            string word = TakeTrackedWord();
-            BloodyBacklight.Log("convert: terminal word=\"" + word + "\"");
-            if (word.Length > 0)
-            {
-                string clipBeforeT = GetClipboardTextWithRetries();
-                string converted = TextConverter.Convert(word);
-                SendBackspaces(word.Length);
-                Thread.Sleep(80);
-                PasteText(converted);
-                Thread.Sleep(150);
-                RestoreClipboard(clipBeforeT);
-                SeedTrackedWord(converted);
-                FinishConvert(console);
-            }
+            BloodyBacklight.Log("convert: nothing convertible");
         }
 
         private static void RestoreClipboard(string text)
@@ -1341,7 +1369,7 @@ namespace LayoutGlow
     // ---------------- Tray application ----------------
     internal sealed class TrayApp : ApplicationContext
     {
-        public const string Version = "0.5.0";
+        public const string Version = "0.6.0";
 
         private readonly NotifyIcon _tray;
         private readonly Settings _settings;
